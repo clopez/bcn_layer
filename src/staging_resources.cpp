@@ -112,6 +112,11 @@ std::pair<VkSemaphore, VkFence> StagingResources::MakeFence() {
 
 void StagingResources::WaitForCompletion() {
     if (has_completed) return;
+    // Resources that were never submitted have no fence and nothing to wait for.
+    if (completed == VK_NULL_HANDLE) {
+        has_completed = true;
+        return;
+    }
     auto *dev = get_device(device);
     if (!dev) return;
     VkResult result = dev->table.WaitForFences(device, 1, &completed, VK_TRUE, UINT64_MAX);
@@ -122,6 +127,107 @@ void StagingResources::WaitForCompletion() {
         }
     }
     has_completed = true;
+}
+
+// Reused buffers are powers of two of at least 4 KiB, so that similar sizes can share them.
+static VkDeviceSize StagingBufferCapacity(VkDeviceSize requestedBytes)
+{
+    constexpr VkDeviceSize kMinCapacity = 4096;
+    if (requestedBytes <= kMinCapacity)
+        return kMinCapacity;
+    // Next power of two at or above requestedBytes.
+    return static_cast<VkDeviceSize>(1) << (64 - __builtin_clzll(static_cast<uint64_t>(requestedBytes) - 1));
+}
+
+void StagingResources::MarkStagingBufferAvailable(struct buffer *buf)
+{
+    if (buf->stagingReuseState != StagingReuseState::Reserved)
+        return;
+    buf->stagingReuseState = StagingReuseState::Available;
+    buf->releaseEpoch = reuseBarrierEpoch;
+    availableBuffers[buf->size].push_back(buf);
+}
+
+// Keep both shader and copy accesses covered, because a reused buffer can change roles, and
+// it's global so that one barrier covers every buffer released before it. Earlier reads are
+// already ordered by the execution dependency, so only earlier writes are made available.
+static void RecordReuseBarrier(const struct command_buffer *cb)
+{
+    constexpr VkPipelineStageFlags kReuseStages =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    VkMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                         VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+    };
+
+    cb->device->table.CmdPipelineBarrier(cb->handle, kReuseStages, kReuseStages, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
+struct buffer *StagingResources::TakeAvailableBuffer(VkDeviceSize capacity, bool acceptUncovered,
+                                                     bool *needsBarrier)
+{
+    auto it = availableBuffers.find(capacity);
+    if (it == availableBuffers.end() || it->second.empty())
+        return nullptr;
+
+    struct buffer *oldest = it->second.front();
+    const bool covered = oldest->releaseEpoch < reuseBarrierEpoch;
+    if (!covered && !acceptUncovered)
+        return nullptr;
+    it->second.pop_front();
+    *needsBarrier = !covered;
+    return oldest;
+}
+
+StagingLease StagingResources::AcquireStagingBuffer(struct command_buffer *cb, VkDeviceSize requestedBytes,
+                                                    VkFormat format, int width, int height)
+{
+    const bool reuseEnabled = cb->device->stagingPool != nullptr;
+    const VkDeviceSize capacity = reuseEnabled ? StagingBufferCapacity(requestedBytes) : requestedBytes;
+
+    // Buffers needing no barrier first: covered ones from this batch, then pooled ones.
+    struct buffer *buf = nullptr;
+    bool needsBarrier = false;
+    if (reuseEnabled) {
+        buf = TakeAvailableBuffer(capacity, /*acceptUncovered=*/false, &needsBarrier);
+        if (!buf) {
+            if (auto pooledBuffer = cb->device->stagingPool->Acquire(capacity)) {
+                buf = pooledBuffer.get();
+                AddStagingBuffer(std::move(pooledBuffer));
+            }
+        }
+        if (!buf)
+            buf = TakeAvailableBuffer(capacity, /*acceptUncovered=*/true, &needsBarrier);
+    }
+
+    if (needsBarrier) {
+        RecordReuseBarrier(cb);
+        reuseBarrierEpoch++;
+    }
+
+    if (!buf) {
+        auto newBuffer = create_staging_buffer(cb->device, capacity, format, width, height);
+        // Idle pooled buffers may be what is using up the memory.
+        if (!newBuffer && reuseEnabled && cb->device->stagingPool->Clear() > 0)
+            newBuffer = create_staging_buffer(cb->device, capacity, format, width, height);
+        if (!newBuffer)
+            return {};
+        buf = newBuffer.get();
+        AddStagingBuffer(std::move(newBuffer));
+    }
+
+    if (reuseEnabled)
+        buf->stagingReuseState = StagingReuseState::Reserved;
+
+    buf->format = format;
+    buf->width = width;
+    buf->height = height;
+    buf->usedSize = staging_buffer_aligned_size(format, requestedBytes);
+    return { this, buf };
 }
 
 ScopedTimestampQuery StagingResources::MakeScopedTimestampQuery(
@@ -326,9 +432,10 @@ void StagingResources::Cleanup() {
     uint64_t total_quantized_weight_errors_refined_7 = 0;
     uint64_t total_quantized_weight_errors_refined_15 = 0;
 
-    for (auto it = stagingBuffers.begin(); it != stagingBuffers.end();) {
-        auto buf = std::move(*it);
-        it = stagingBuffers.erase(it);
+    availableBuffers.clear();
+    std::vector<std::unique_ptr<struct buffer>> poolReturns;
+
+    for (auto &buf : stagingBuffers) {
         if (!buf) continue;
 
         if (!dev->dump_buffers_path.empty()) {
@@ -414,8 +521,21 @@ void StagingResources::Cleanup() {
             dev->table.UnmapMemory(device, buf->memory);
         }
 
+        // Only the buffers that AcquireStagingBuffer() handed out with reuse on have a reuse state.
+        if (buf->stagingReuseState != StagingReuseState::NotReusable && dev->stagingPool) {
+            poolReturns.push_back(std::move(buf));
+            continue;
+        }
+
         dev->table.DestroyBuffer(device, buf->handle, buf->alloc);
         dev->table.FreeMemory(device, buf->memory, buf->alloc);
+    }
+    stagingBuffers.clear();
+
+    if (dev->stagingPool) {
+        dev->stagingPool->ReturnAll(std::move(poolReturns));
+        if (dev->profile_transfers)
+            dev->stagingPool->LogStats();
     }
 
     if (dev->debug_astc) {

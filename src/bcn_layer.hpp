@@ -5,6 +5,7 @@
 #include "vk_func.hpp"
 #include "logger.hpp"
 #include "staging_resources.hpp"
+#include "staging_pool.hpp"
 
 #include <cstdint>
 #include <vulkan/vulkan.h>
@@ -127,6 +128,8 @@ struct device {
 	const VkAllocationCallbacks *alloc;
 	std::unique_ptr<SyncPool> syncPool;
 	std::unique_ptr<DescriptorSetAllocator> descriptorSetAllocator;
+	// Only exists when staging buffer reuse is on, so it is also the reuse switch.
+	std::unique_ptr<StagingBufferPool> stagingPool;
 	std::vector<std::unique_ptr<StagingResources>> stagingResourcesQueue;
 	std::condition_variable hasCleanupWork;
 	std::thread finalizer_thread;

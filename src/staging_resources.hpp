@@ -5,6 +5,8 @@
 
 #include <vulkan/vulkan.h>
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <vector>
 #include <string>
 
@@ -108,6 +110,41 @@ private:
     VkPipelineStageFlagBits m_endStage;
 };
 
+struct StagingResources;
+
+// Keeps a staging buffer Reserved, so no other request of the batch is given it, until the lease
+// ends. Hold it until every command that uses the buffer has been recorded.
+class StagingLease {
+public:
+    StagingLease() = default;
+    StagingLease(StagingResources *resources, struct buffer *buf) : m_resources(resources), m_buf(buf) {}
+    ~StagingLease() { Release(); }
+
+    StagingLease(const StagingLease&) = delete;
+    StagingLease& operator=(const StagingLease&) = delete;
+    StagingLease(StagingLease&& other) noexcept
+        : m_resources(other.m_resources), m_buf(other.m_buf) { other.m_buf = nullptr; }
+    StagingLease& operator=(StagingLease&& other) noexcept {
+        if (this != &other) {
+            Release();
+            m_resources = other.m_resources;
+            m_buf = other.m_buf;
+            other.m_buf = nullptr;
+        }
+        return *this;
+    }
+
+    struct buffer *get() const { return m_buf; }
+    struct buffer *operator->() const { return m_buf; }
+    explicit operator bool() const { return m_buf != nullptr; }
+
+    inline void Release();
+
+private:
+    StagingResources *m_resources = nullptr;
+    struct buffer *m_buf = nullptr;
+};
+
 struct StagingResources {
 public:
     explicit StagingResources(VkDevice device): device(device) {}
@@ -125,9 +162,12 @@ public:
     void AddStagingBuffer(std::unique_ptr<struct buffer> buf) { stagingBuffers.push_back(std::move(buf)); }
     void AddStagingImageView(VkImageView view) { stagingImageViews.push_back(view); }
     void AddDescriptorSet(VkDescriptorPool pool, VkDescriptorSet set) { descriptorSets.push_back({ pool, set }); }
+    // Records the reuse barrier itself when one is needed; an empty lease means allocation failed.
+    StagingLease AcquireStagingBuffer(struct command_buffer *cb, VkDeviceSize requestedBytes,
+                                      VkFormat format, int width, int height);
     int Size() const { return stagingBuffers.size(); }
-    int MemoryUsage(VkFormat format = VK_FORMAT_UNDEFINED) const {
-        int usage = 0;
+    VkDeviceSize MemoryUsage(VkFormat format = VK_FORMAT_UNDEFINED) const {
+        VkDeviceSize usage = 0;
         for (const auto& buf : stagingBuffers) {
             if (format == VK_FORMAT_UNDEFINED || buf->format == format) {
                 usage += buf->size;
@@ -147,7 +187,14 @@ public:
     int64_t timestamp = 0;
 
 private:
+    friend class StagingLease;
     static const uint32_t kPoolBlockSize = 128;
+
+    // Called when a StagingLease ends. The GPU may still be using buf.
+    void MarkStagingBufferAvailable(struct buffer *buf);
+    // Takes the Available buffer of this capacity released longest ago. Unless acceptUncovered is
+    // set, only one that a reuse barrier already covers; sets *needsBarrier when it isn't covered.
+    struct buffer *TakeAvailableBuffer(VkDeviceSize capacity, bool acceptUncovered, bool *needsBarrier);
 
     VkFence completed = VK_NULL_HANDLE;
     VkSemaphore semaphore = VK_NULL_HANDLE;
@@ -155,11 +202,23 @@ private:
 
     bool freed = false;
     bool has_completed = false;
+    // Number of reuse barriers recorded in this batch.
+    uint64_t reuseBarrierEpoch = 0;
     std::vector<std::unique_ptr<struct buffer>> stagingBuffers;
+    // Available buffers of each capacity, in the order they were released. Release epochs never
+    // decrease, so if any buffer of a capacity is covered by a reuse barrier, the front one is.
+    std::map<VkDeviceSize, std::deque<struct buffer *>> availableBuffers;
     std::vector<VkImageView> stagingImageViews;
     std::vector<std::pair<VkDescriptorPool, VkDescriptorSet>> descriptorSets;
     std::vector<QueryPoolBlock> queryPools;
     std::vector<TimestampQuery> trackedQueries;
 };
+
+void StagingLease::Release()
+{
+    if (m_buf)
+        m_resources->MarkStagingBufferAvailable(m_buf);
+    m_buf = nullptr;
+}
 
 #endif

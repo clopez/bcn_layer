@@ -3,7 +3,9 @@
 #include "logger.hpp"
 #include "vulkan/vk_layer.h"
 
+#include <algorithm>
 #include <memory>
+#include <cstdlib>
 #include <unistd.h>
 #include <cmath>
 #include <utility>
@@ -19,6 +21,39 @@ std::unordered_map<void *, std::shared_ptr<struct device>> deviceMap;
 bool bcn_compute_auto = false;
 
 std::mutex global_lock;
+
+// Call after the debugging options are set, since some of them turn reuse off.
+static void ConfigureStagingReuse(struct device *device)
+{
+    const char *disableReuseEnv = getenv("BCN_DISABLE_BUFFER_REUSE");
+    if (disableReuseEnv && atoi(disableReuseEnv)) {
+        Logger::log("info", "staging buffer reuse: disabled by BCN_DISABLE_BUFFER_REUSE, every conversion allocates its own buffers");
+        return;
+    }
+
+    const char *conflict = nullptr;
+    if (!device->dump_buffers_path.empty()) {
+        conflict = "BCN_DUMP_BUFFERS_PATH is set: buffer dumps are written at cleanup and need each conversion's data in its own buffer";
+    } else if (device->debug_astc) {
+        conflict = "BCN_DEBUG_ASTC_DIAGNOSTICS is on: the diagnostics read each conversion's output buffer at cleanup";
+    } else if (device->add_watermark) {
+        conflict = "BCN_ADD_WATERMARK is on: watermarks identify each conversion by its buffer's ID";
+    } else if (device->sample_gpu_counters) {
+        conflict = "BCN_SAMPLE_GPU_COUNTERS is on: its one-shot command buffers cannot be ordered by reuse barriers in the game's command buffer";
+    }
+    if (conflict) {
+        Logger::log("info", "staging buffer reuse: disabled because %s", conflict);
+        return;
+    }
+
+    Logger::log("info", "staging buffer reuse: enabled, conversions share buffers of the same capacity, ordered by barriers");
+
+    device->stagingPool = std::make_unique<StagingBufferPool>(
+        device, kStagingPoolMaxIdleBytes, kStagingPoolIdleTimeout);
+    Logger::log("info", "staging buffer pool: keeping up to %llu MiB of idle buffers for %lld ms",
+        (unsigned long long) (kStagingPoolMaxIdleBytes >> 20),
+        (long long) std::chrono::duration_cast<std::chrono::milliseconds>(kStagingPoolIdleTimeout).count());
+}
 
 #define GETPROCADDR(func) \
 if (!strcmp(pName, "vk" #func)) \
@@ -546,14 +581,22 @@ BCnLayer_GetPhysicalDeviceFormatProperties2(VkPhysicalDevice physicalDevice,
 }
 
 void FinalizerThread(struct device* dev) {
+    // Wakes up when the next idle pooled buffer expires, so the pool shrinks after an upload burst.
+    // Every buffer enters the pool from this thread, so the deadline is only recomputed here.
+    std::optional<StagingBufferPool::Clock::time_point> nextTrim;
     while (!dev->stop_thread) {
         {
             std::vector<std::unique_ptr<StagingResources>> queue;
             {
                 std::unique_lock<std::mutex> lock(global_lock);
-                dev->hasCleanupWork.wait(lock, [dev] {
+                auto hasWork = [dev] {
                     return dev->stop_thread || !dev->stagingResourcesQueue.empty();
-                });
+                };
+                if (nextTrim) {
+                    dev->hasCleanupWork.wait_until(lock, *nextTrim, hasWork);
+                } else {
+                    dev->hasCleanupWork.wait(lock, hasWork);
+                }
 
                 if (dev->stop_thread) {
                     return;
@@ -564,15 +607,17 @@ void FinalizerThread(struct device* dev) {
                 }
             }
 
-            while (!queue.empty()) {
+            for (auto& stagingResources : queue) {
                 if (dev->stop_thread) return;
-                std::unique_ptr<StagingResources> stagingResources = std::move(queue.back());
-                queue.pop_back();
                 if (stagingResources) {
                     stagingResources->WaitForCompletion();
                     stagingResources->Cleanup();
                 }
             }
+        }
+
+        if (dev->stagingPool) {
+            nextTrim = dev->stagingPool->Trim();
         }
     }
 }
@@ -1031,6 +1076,8 @@ BCnLayer_CreateDevice(VkPhysicalDevice physicalDevice,
         device->dump_buffers_path = "";
     }
 
+    ConfigureStagingReuse(device.get());
+
     auto now = std::chrono::system_clock::now();
     auto start_timestamp = std::chrono::time_point_cast<std::chrono::milliseconds>(now).time_since_epoch().count();
 
@@ -1106,6 +1153,9 @@ BCnLayer_DestroyDevice(VkDevice device,
 		stagingResources->Cleanup();
 	}
 	dev->stagingResourcesQueue.clear();
+	if (dev->stagingPool) {
+		dev->stagingPool->Clear();
+	}
 	dev->syncPool.reset();
 	dev->descriptorSetAllocator->cleanup();
 	dev->descriptorSetAllocator.reset();

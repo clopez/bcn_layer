@@ -6,30 +6,51 @@
 std::unordered_map<VkBuffer, std::unique_ptr<struct buffer>> buffersMap;
 std::atomic<int> bufferIdCounter;
 
+VkDeviceSize
+staging_buffer_aligned_size(VkFormat format, VkDeviceSize bytes)
+{
+	VkDeviceSize alignment = 16;
+	if (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB) {
+	    alignment = 64;
+	} else if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+	    alignment = 128;
+	}
+
+	// [info]: buffer handle: 0xd2a0000000d2a, size: 64, mem size: 64, fmt: 97, width: 2, height: 2
+	// The descriptor buffer (VkBuffer 0xd2a0000000d2a) size is 64 bytes, 64 bytes were bound,
+	// and the highest out of bounds access was at [79] bytes
+	return AlignUp(bytes, alignment);
+}
+
+VkDescriptorBufferInfo
+buffer::descriptorInfoAt(VkDeviceSize absoluteOffset) const
+{
+	if (!usedSize)
+		return { handle, absoluteOffset, VK_WHOLE_SIZE };
+
+	if (absoluteOffset >= usedSize) {
+		Logger::log("error", "descriptor offset %llu is past the %llu bytes used in staging buffer %d",
+			(unsigned long long) absoluteOffset, (unsigned long long) usedSize, id);
+		return { handle, absoluteOffset, VK_WHOLE_SIZE };
+	}
+	return { handle, absoluteOffset, usedSize - absoluteOffset };
+}
+
 std::unique_ptr<struct buffer>
-create_staging_buffer(struct device *dev, int size, VkFormat format, int width, int height, std::string_view label)
+create_staging_buffer(struct device *dev, VkDeviceSize size, VkFormat format, int width, int height, std::string_view label)
 {
 	VkResult result;
 	VkBuffer buffer;
 	VkDeviceMemory memory;
 	VkLayerDispatchTable table = dev->table;
 	VkDevice device = dev->handle;
-	uint align = 15;
-	if (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB) {
-	    align = 63;
-	} else if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
-	    align = 127;
-	}
 
-	// [info]: buffer handle: 0xd2a0000000d2a, size: 64, mem size: 64, fmt: 97, width: 2, height: 2
-	// The descriptor buffer (VkBuffer 0xd2a0000000d2a) size is 64 bytes, 64 bytes were bound,
-	// and the highest out of bounds access was at [79] bytes
-	size = (size + align) & ~align;
+	size = staging_buffer_aligned_size(format, size);
 	VkBufferCreateInfo buffer_create_info = {
 		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
 		.pNext = nullptr,
 		.flags = 0,
-		.size = static_cast<VkDeviceSize>(size),
+		.size = size,
 		.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
 		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
 		.queueFamilyIndexCount = 0,
@@ -55,12 +76,15 @@ create_staging_buffer(struct device *dev, int size, VkFormat format, int width, 
 	result = table.AllocateMemory(device, &allocate_info, nullptr, &memory);
 	if (result != VK_SUCCESS) {
 		Logger::log("error", "Failed to allocate staging buffer memory, res %d", result);
+		table.DestroyBuffer(device, buffer, nullptr);
 		return NULL;
 	}
 
 	result = table.BindBufferMemory(device, buffer, memory, 0);
 	if (result != VK_SUCCESS) {
 		Logger::log("error", "Failed to bind staging buffer memory, res %d", result);
+		table.DestroyBuffer(device, buffer, nullptr);
+		table.FreeMemory(device, memory, nullptr);
 		return NULL;
 	}
 
@@ -72,6 +96,7 @@ create_staging_buffer(struct device *dev, int size, VkFormat format, int width, 
 	staging_buf->device = dev;
 	staging_buf->alloc = nullptr;
 	staging_buf->size = size;
+	staging_buf->usedSize = size;
 	staging_buf->format = format;
 	staging_buf->label = label;
 	staging_buf->width = width;
